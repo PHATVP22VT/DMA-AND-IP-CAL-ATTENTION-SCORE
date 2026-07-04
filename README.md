@@ -12,6 +12,7 @@ Hardware accelerator tính **S = Q × Kᵀ** (Scaled Dot-Product Attention Score
 - Dataflow: Weight-Stationary — K nạp vào BRAM, preload vào PE; Q stream trực tiếp vào MAC.
 - Target: Xilinx KV260 (Vivado).
 - Scope: chỉ Q×Kᵀ. Softmax và V-matmul là IP riêng, **chưa tích hợp** — xem mục 8 nếu làm tiếp.
+<img width="2390" height="1104" alt="Welcome to FigJam" src="https://github.com/user-attachments/assets/42869fc7-e2c1-4fd6-94ca-8cad4881f684" />
 
 ---
 

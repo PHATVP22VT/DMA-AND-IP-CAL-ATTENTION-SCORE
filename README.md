@@ -23,7 +23,8 @@ Hardware accelerator tính **S = Q × Kᵀ** (Scaled Dot-Product Attention Score
 | `ip_axi_linear_slave_lite_v5_0_S00_AXI` | AXI4-Lite slave, control plane |
 | `linear` | Core FSM + datapath (module `linear`) |
 | `matmul_ip` | PE array (module `matmul_ip`, `pe_unit`) |
-| `tb_ip_axi_linear` | Testbench, dùng AXI VIP, so golden model |
+| `tb_ip_axi_linear` | Testbench cũ — AXI VIP stream trực tiếp (không DMA), dùng để test tiling |
+| `tb_dma` | Testbench tích hợp DMA — VIP drive AXI DMA + BRAM, so golden model |
 | `k_ram` | Vivado Block Memory Generator IP (không phải RTL source, sinh qua IP Catalog) |
 
 
@@ -121,7 +122,17 @@ An toàn vì serialize tốn `D_HEAD` cycle < tile loop mỗi row tốn `N_TILES
 
 ### `tlast` / `compute_done`
 
-`o_m_axis_tlast` assert khi `ser_col_j == D_HEAD-1`. `compute_done` là pulse đã register của `last_row_last_col` (handshake cuối của row cuối, `ser_row_i == SEQ_LEN-1`).
+`o_m_axis_tlast` **chỉ assert tại word cuối cùng của toàn bộ frame** (phần tử `[SEQ_LEN-1][D_HEAD-1]`), không phải cuối mỗi row.
+
+```systemverilog
+assign o_m_axis_tlast = serialize_active
+                      & (ser_col_j == J_W'(D_HEAD - 1))
+                      & (ser_row_i == S_W'(SEQ_LEN - 1));
+```
+
+Lý do bắt buộc khi dùng AXI DMA S2MM direct mode: DMA coi `TLAST` là tín hiệu kết thúc packet và set `IOC_IRQ`. Nếu `TLAST` assert sau mỗi row, DMA kết thúc transfer sau row đầu tiên (chỉ nhận `D_HEAD * 4` byte thay vì `SEQ_LEN * D_HEAD * 4` byte), deassert `M_AXIS_TREADY`, gây backpressure stall toàn bộ output path — MM2S Q-stream treo theo.
+
+`compute_done` (dùng để set `latched_done` trong AXI-Lite slave) là pulse 1 cycle được register từ handshake cuối cùng của serializer (`ser_col_j == D_HEAD-1 & ser_row_i == SEQ_LEN-1 & tready`). Timing này trùng với `TLAST` — không đổi datapath, không đổi `result_buffer` hay MAC timing.
 
 ---
 
@@ -141,14 +152,15 @@ An toàn vì serialize tốn `D_HEAD` cycle < tile loop mỗi row tốn `N_TILES
 
 ---
 
-## 7. Testbench (`tb_ip_axi_linear.sv`)
+## 7. Testbench
 
-- VIP: 1× AXI4-Lite Master VIP, 1× AXI4-Stream Master VIP, 1× AXI4-Stream Slave VIP.
-- TB config: `SEQ_LEN=16, D_HEAD=16, D_MODEL=64`, `N_PE` sửa trực tiếp trong `localparam` (dòng có comment `>>> SỬA SỐ NÀY <<<`) — `N_TILES` tự tính `ceil(D_HEAD/N_PE)`. **Lưu ý:** đổi `N_PE` trong TB chỉ ảnh hưởng cách TB tính `K_DEPTH/Q_DEPTH` và log; DUT (`ip_axi_linear_0`, packaged IP) phải được re-customize cùng giá trị `N_PE` trong Vivado thì mới thực sự đổi hành vi.
-- So sánh `captured_out[]` vs `golden_out[]` đọc từ file `.mem` (golden model ngoài, đường dẫn hardcode local máy — **cần đổi path khi chạy trên máy khác**, xem `MEM_Q/MEM_K/MEM_GOLDEN/RTL_OUT_DIR` ở đầu file).
-- Kết quả PASS: tất cả `OUT_DEPTH = SEQ_LEN×D_HEAD = 256` words khớp golden, không có `AXI4STREAM_ERRM_TDATA_X` trên M_AXIS (TB có thêm monitor `$isunknown()` độc lập để ra verdict PASS/FAIL bằng code). Có watchdog timeout (`TIMEOUT_CYCLES`) chặn sim treo vô hạn nếu có deadlock handshake.
+### 7a. `tb_ip_axi_linear.sv` — TB cũ (AXI-Stream VIP trực tiếp)
 
-### Test case tiling đã pass
+TB gốc, không dùng DMA. VIP stream K/Q trực tiếp vào S_AXIS của IP, VIP slave thu M_AXIS. Mục đích chính: test tiling với nhiều cấu hình `N_PE`.
+
+TB config: `SEQ_LEN=16, D_HEAD=16, D_MODEL=64`. `N_PE` sửa trực tiếp trong `localparam` — `N_TILES` tự tính `ceil(D_HEAD/N_PE)`. Đổi `N_PE` trong TB không đổi hành vi DUT; phải re-customize packaged IP trong Vivado cùng giá trị.
+
+**Test case tiling đã pass:**
 
 | # | Config (`D_HEAD / N_PE / N_TILES`) | Ghi chú | Kết quả |
 |---|---|---|---|
@@ -160,24 +172,127 @@ An toàn vì serialize tốn `D_HEAD` cycle < tile loop mỗi row tốn `N_TILES
 | 6 | 16 / 1 / 16 | Cực trị N_PE=1, mỗi tile 1 PE | PASS |
 | 7 | 13 / 4 hoặc 8 / — | D_HEAD lẻ, không chia hết N_PE | PASS |
 
-### Giới hạn coverage còn lại của TB
+---
+
+### 7b. `tb_dma.sv` — TB tích hợp DMA (TB hiện tại)
+
+#### Block design
+
+```
+vip_ctrl (AXI VIP Master)
+    └─► smartconnect_0
+            ├─► axi_dma_0         (S_AXI_LITE,  0x4000_0000)
+            ├─► ip_axi_linear_0   (S00_AXI,     0x4001_0000)
+            ├─► bram_ctrl_src     (S_AXI,        0x0000_0000)  → bram_src
+            └─► bram_ctrl_dst     (S_AXI,        0x0001_0000)  → bram_dst
+
+axi_dma_0 MM2S ──► ip_axi_linear_0 S00_AXIS
+axi_dma_0 S2MM ◄── ip_axi_linear_0 M00_AXIS
+
+Interrupt: mm2s_introut, s2mm_introut (ra top-level port, TB poll qua DMASR)
+```
+
+#### Memory map
+
+| Địa chỉ | Vùng | Nội dung |
+|---|---|---|
+| `0x0000_0000` | `bram_src` (via `bram_ctrl_src`) | K: `[0 .. D_HEAD×D_MODEL×4 - 1]` bytes, Q: tiếp theo |
+| `0x0001_0000` | `bram_dst` (via `bram_ctrl_dst`) | Output S: `SEQ_LEN × D_HEAD` words |
+| `0x4000_0000` | `axi_dma_0` S_AXI_LITE | DMA register space |
+| `0x4001_0000` | `ip_axi_linear_0` S00_AXI | IP Linear register space |
+
+`bram_src` layout: K nạp trước tại `SRC_BASE = 0x0`, Q nạp liền sau tại `SRC_BASE + NUM_BYTES_K`. Hai transfer MM2S riêng biệt dùng SA khác nhau.
+
+#### DMA register offsets dùng trong TB
+
+| Offset từ `DMA_BASE` | Tên | Dùng để |
+|---|---|---|
+| `0x00` | `MM2S_DMACR` | bit[0]=RS (run/stop), bit[2]=reset |
+| `0x04` | `MM2S_DMASR` | bit[1]=Idle, bit[12]=IOC_IRQ, bit[14]=ERR_IRQ |
+| `0x18` | `MM2S_SA` | Source address |
+| `0x28` | `MM2S_LENGTH` | Transfer length (bytes) — trigger transfer khi ghi |
+| `0x30` | `S2MM_DMACR` | bit[0]=RS, bit[2]=reset |
+| `0x34` | `S2MM_DMASR` | bit[1]=Idle, bit[12]=IOC_IRQ, bit[14]=ERR_IRQ |
+| `0x48` | `S2MM_DA` | Destination address |
+| `0x58` | `S2MM_LENGTH` | Transfer length (bytes) — trigger transfer khi ghi |
+
+#### Execution flow (`dma_start_transfer`)
+
+```
+1. MM2S_DMACR[RS] = 1                       (enable MM2S channel)
+2. MM2S_SA = K_BASE (0x0000_0000)
+3. IL_S00_SLV0 = 0x1                        (Start ip_linear — FSM vào ST_LOAD_K)
+4. MM2S_LENGTH = D_HEAD × D_MODEL × 4      (trigger: DMA stream K → IP S_AXIS)
+5. Poll MM2S_DMASR[IOC_IRQ]                 (chờ K transfer xong)
+6. Clear MM2S_DMASR[IOC_IRQ] = 1
+7. S2MM_DMACR[RS] = 1                       (enable S2MM channel)
+8. S2MM_DA = DST_BASE (0x0001_0000)
+9. S2MM_LENGTH = SEQ_LEN × D_HEAD × 4      (arm output — DMA chờ TVALID từ IP)
+10. MM2S_SA = Q_BASE (K_BASE + NUM_BYTES_K)
+11. MM2S_LENGTH = SEQ_LEN × D_MODEL × 4   (trigger: DMA stream Q → IP S_AXIS)
+12. Poll MM2S_DMASR[IOC_IRQ]                (chờ Q transfer xong)
+13. Poll S2MM_DMASR[IOC_IRQ]               (chờ output S ghi xong vào bram_dst)
+```
+
+**Lưu ý thứ tự bước 3 và 4:** Start ip_linear (`SLV0=1`) phải ghi **trước** `MM2S_LENGTH`. Nếu ghi ngược lại, DMA bắt đầu stream K khi IP vẫn ở `ST_IDLE` (`tready=0`), gây stall MM2S ngay từ beat đầu. Thứ tự đúng: kick FSM → FSM vào `ST_LOAD_K` (tready=1) → DMA start.
+
+**Lưu ý bước 7–9 (arm S2MM trước khi feed Q):** S2MM phải được arm (`S2MM_LENGTH` ghi) trước khi IP bắt đầu serialize output. Nếu arm trễ, các beat đầu của M_AXIS không có `TREADY`, IP stall serialize; khi S2MM cuối cùng arm, IP tiếp tục — không mất data nhờ backpressure — nhưng tạo thêm latency không cần thiết.
+
+#### Verification
+
+- So sánh `bram_dst` (đọc qua `bram_ctrl_dst`) với `golden_score` từ file `.mem` word-by-word.
+- Pass criterion: tất cả `SEQ_LEN × D_HEAD = 256` words khớp.
+- Kết quả mismatch in tối đa 20 entry đầu với delta để debug.
+- Dump output ra file `.mem` (`RTL_SCORE`) sau mỗi run.
+- Đường dẫn file `.mem` hardcode — **cần đổi `MEM_Q`, `MEM_K`, `GOLDEN_SCORE`, `RTL_SCORE`** khi chạy trên máy khác.
+- Timeout: `wait_mm2s_done` / `wait_s2mm_done` bail sau 10 000 vòng poll, `$fatal` nếu treo.
+
+#### Coverage gaps của `tb_dma`
 
 | Gap | Chi tiết |
 |---|---|
-| Không test polling Done/Busy | `S00_STATUS` (offset `0x4`) được định nghĩa làm localparam nhưng **không được TB đọc bao giờ**. TB tự biết hoàn tất bằng cách đếm đủ `OUT_DEPTH` word ở AXI-Stream slave, không qua AXI-Lite polling như SW protocol thật sẽ làm. |
-| Không test backpressure | `set_axis_slave_ready()` dùng `XIL_AXI4STREAM_READY_GEN_NO_BACKPRESSURE` — slave luôn ready. Logic `axis_out_stall` trong RTL, kể cả trong lúc tile loop, **chưa được TB exercise**. |
-| Chưa test config D_MODEL sát biên D_HEAD | Chưa có case `D_MODEL == D_HEAD` (chạm đúng assertion `D_MODEL >= D_HEAD`) để verify margin an toàn ping-pong ở biên. |
+| Không poll `IL_S00_STATUS` (offset `0x4`) | TB kết luận done qua `S2MM_DMASR[IOC_IRQ]`, không đọc `latched_done` của IP. AXI-Lite polling path chưa được exercise trong flow DMA. |
+| Không test backpressure S2MM | `S2MM_LENGTH` arm trước khi Q feed → TREADY gần như luôn sẵn. Logic `axis_out_stall` trong RTL chưa bị kích hoạt. |
+| Không test tiling (`N_PE < D_HEAD`) | TB DMA fix `N_PE=16=D_HEAD` (`N_TILES=1`). Tiling đã pass ở `tb_ip_axi_linear`; chưa có DMA-level regression cho `N_TILES > 1`. |
+| Chưa test `D_MODEL == D_HEAD` boundary | Chưa verify assertion `D_MODEL >= D_HEAD` ở biên bằng DMA flow. |
 
 ---
 
-## 9. SW Protocol đầy đủ (đã cập nhật bước 5 — bắt buộc)
+## 9. SW Protocol đầy đủ
+
+Protocol dưới đây phản ánh đúng sequence đã verify trong `tb_dma`. Thứ tự các bước là bắt buộc — xem giải thích thứ tự tại mục 7b.
 
 ```
-1. DMA MM2S: stream K [D_HEAD × D_MODEL] elements → S_AXIS
-2. AXI-Lite write: addr=0x0, data=0x1        (Start)
-3. DMA MM2S: stream Q [SEQ_LEN × D_MODEL] elements → S_AXIS
-4. DMA S2MM arm: nhận [SEQ_LEN × D_HEAD] elements từ M_AXIS
-5. Poll addr=0x4 bit[0] (Done), hoặc dùng interrupt nếu có
+// --- Phase 1: Preload source data ---
+1. Ghi K vào bram_src tại SRC_BASE          (AXI write, D_HEAD × D_MODEL × 4 bytes)
+2. Ghi Q vào bram_src tại SRC_BASE + NUM_BYTES_K  (AXI write, SEQ_LEN × D_MODEL × 4 bytes)
+
+// --- Phase 2: Reset DMA ---
+3. MM2S_DMACR[RESET] = 1, poll đến khi bit tự clear
+4. S2MM_DMACR[RESET] = 1, poll đến khi bit tự clear
+
+// --- Phase 3: Stream K + kick IP ---
+5. MM2S_DMACR[RS] = 1                        (enable MM2S channel)
+6. MM2S_SA = SRC_BASE                        (K start address)
+7. IL_S00_SLV0 = 0x1                         (Start ip_linear — FSM vào ST_LOAD_K, tready=1)
+8. MM2S_LENGTH = D_HEAD × D_MODEL × 4       (trigger MM2S: stream K → ip_linear S_AXIS)
+9. Poll MM2S_DMASR[IOC_IRQ] đến khi = 1
+10. Clear IOC: MM2S_DMASR = 0x1000
+
+// --- Phase 4: Arm output, stream Q ---
+11. S2MM_DMACR[RS] = 1                       (enable S2MM channel)
+12. S2MM_DA = DST_BASE                       (output destination: bram_dst)
+13. S2MM_LENGTH = SEQ_LEN × D_HEAD × 4     (arm S2MM — chờ TVALID từ ip_linear)
+14. MM2S_SA = SRC_BASE + NUM_BYTES_K        (Q start address)
+15. MM2S_LENGTH = SEQ_LEN × D_MODEL × 4    (trigger MM2S: stream Q → ip_linear S_AXIS)
+
+// --- Phase 5: Wait completion ---
+16. Poll MM2S_DMASR[IOC_IRQ] đến khi = 1   (Q transfer done)
+17. Poll S2MM_DMASR[IOC_IRQ] đến khi = 1   (output S ghi xong vào bram_dst)
+
+// --- Phase 6: Read result ---
+18. Đọc bram_dst từ DST_BASE                (SEQ_LEN × D_HEAD × 4 bytes)
 ```
 
+Nếu dùng interrupt thay vì polling: enable `IOC_IrqEn` trong `DMACR` trước khi trigger transfer, xử lý trong ISR thay cho bước poll 9/16/17.
 
